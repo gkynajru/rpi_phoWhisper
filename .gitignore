@@ -9,6 +9,8 @@ __pycache__/
 *.txt
 *.log
 
+models/
+
 # VSCode & system files
 .vscode/
 .DS_Store
