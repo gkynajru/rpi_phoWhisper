@@ -1,279 +1,265 @@
-
 import os
 import time
 import json
 import pickle
 import torch
-from typing import Dict, Any, List
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoModelForTokenClassification
 
-# Model paths - adjust these based on your actual model directory structure
-MODEL_BASE_PATH = "models/phobert"
-INTENT_MODEL_PATH = os.path.join(MODEL_BASE_PATH, "intent_classifier_final")
-NER_MODEL_PATH = os.path.join(MODEL_BASE_PATH, "ner_model_final")
-INTENT_ENCODER_PATH = os.path.join(MODEL_BASE_PATH, "intent_encoder.pkl")
-LABEL_MAPPINGS_PATH = os.path.join(NER_MODEL_PATH, "label_mappings.json")
+# Model paths - adjust these to match your actual model structure
+MODEL_PATH = "models/phobert"
+INTENT_MODEL_PATH = os.path.join(MODEL_PATH, "intent_classifier_final")
+NER_MODEL_PATH = os.path.join(MODEL_PATH, "ner_model_final")
 
-# Data directories
+# Data directories (following the same pattern as daemon_stt.py)
 TXT_DIR = "data/transcriptions"
 OUT_DIR = "data/nlu_results"
 
-class VNSLUProcessor:
-    """Vietnamese Spoken Language Understanding processor using PhoBERT"""
+class VNSLUPipeline:
+    """Vietnamese SLU Pipeline for the rpi_phoWhisper project"""
     
     def __init__(self):
-        """Initialize the NLU processor with trained models"""
         print(" Loading Vietnamese NLU models...")
         
-        # Load tokenizer
+        # Load tokenizer (PhoBERT base)
         self.tokenizer = AutoTokenizer.from_pretrained("vinai/phobert-base")
         
-        # Load models
-        try:
-            self.intent_model = AutoModelForSequenceClassification.from_pretrained(INTENT_MODEL_PATH)
-            self.ner_model = AutoModelForTokenClassification.from_pretrained(NER_MODEL_PATH)
-            print(" Models loaded successfully")
-        except Exception as e:
-            print(f" Error loading models: {e}")
-            raise
+        # Load trained models
+        self.intent_model = AutoModelForSequenceClassification.from_pretrained(INTENT_MODEL_PATH)
+        self.ner_model = AutoModelForTokenClassification.from_pretrained(NER_MODEL_PATH)
         
-        # Load encoders and label mappings
-        try:
-            with open(INTENT_ENCODER_PATH, 'rb') as f:
-                self.intent_encoder = pickle.load(f)
-            
-            with open(LABEL_MAPPINGS_PATH, 'r', encoding='utf-8') as f:
-                label_data = json.load(f)
-                self.slot_labels = label_data['slot_labels']
-                self.id2label = {int(k): v for k, v in label_data['id2label'].items()}
-            
-            print(" Encoders and mappings loaded")
-        except Exception as e:
-            print(f" Error loading encoders: {e}")
-            raise
+        # Load label encoders
+        self._load_label_mappings()
         
         # Set models to evaluation mode
         self.intent_model.eval()
         self.ner_model.eval()
         
-        # Move to GPU if available
-        if torch.cuda.is_available():
-            self.intent_model = self.intent_model.cuda()
-            self.ner_model = self.ner_model.cuda()
-            print(" Models moved to GPU")
-        
-        print(" NLU processor ready!")
+        print(" NLU pipeline ready!")
     
-    def predict(self, text: str) -> Dict[str, Any]:
-        """
-        Predict intent and entities for Vietnamese text
-        
-        Args:
-            text: Input Vietnamese text
+    def _load_label_mappings(self):
+        """Load intent encoder and NER label mappings"""
+        try:
+            # Load intent encoder
+            intent_encoder_path = os.path.join(MODEL_PATH, "intent_encoder.pkl")
+            with open(intent_encoder_path, 'rb') as f:
+                self.intent_encoder = pickle.load(f)
             
-        Returns:
-            Dictionary containing intent and entities
-        """
-        # Intent prediction
-        intent_result = self._predict_intent(text)
-        
-        # NER prediction  
-        entities = self._predict_entities(text)
-        
-        return {
-            'text': text,
-            'intent': intent_result['intent'],
-            'intent_confidence': intent_result['confidence'],
-            'entities': entities,
-            'timestamp': time.time()
-        }
+            # Load NER label mappings
+            label_mappings_path = os.path.join(NER_MODEL_PATH, "label_mappings.json")
+            with open(label_mappings_path, 'r', encoding='utf-8') as f:
+                label_data = json.load(f)
+                self.id2label = {int(k): v for k, v in label_data['id2label'].items()}
+            
+            print(" Label mappings loaded")
+            
+        except Exception as e:
+            print(f" Error loading label mappings: {e}")
+            # Fallback - create basic mappings if files don't exist
+            print("  Using fallback label mappings")
+            self.intent_encoder = None
+            self.id2label = {0: 'O'}  # Basic 'Outside' label
     
-    def _predict_intent(self, text: str) -> Dict[str, Any]:
+    def predict_intent(self, text):
         """Predict intent for the input text"""
-        # Tokenize input
-        intent_inputs = self.tokenizer(
+        inputs = self.tokenizer(
             text, 
             return_tensors="pt", 
+            padding=True, 
             truncation=True, 
-            padding=True,
             max_length=128
         )
         
-        # Move to GPU if available
-        if torch.cuda.is_available():
-            intent_inputs = {k: v.cuda() for k, v in intent_inputs.items()}
-        
-        # Predict
         with torch.no_grad():
-            intent_outputs = self.intent_model(**intent_inputs)
-            intent_logits = intent_outputs.logits
-            predicted_intent_id = torch.argmax(intent_logits, dim=-1).item()
-            intent_confidence = torch.softmax(intent_logits, dim=-1).max().item()
+            outputs = self.intent_model(**inputs)
+            logits = outputs.logits
+            predicted_id = torch.argmax(logits, dim=-1).item()
+            confidence = torch.softmax(logits, dim=-1).max().item()
         
         # Convert ID to intent label
-        predicted_intent = self.intent_encoder.inverse_transform([predicted_intent_id])[0]
+        if self.intent_encoder:
+            try:
+                predicted_intent = self.intent_encoder.inverse_transform([predicted_id])[0]
+            except:
+                predicted_intent = f"intent_{predicted_id}"
+        else:
+            predicted_intent = f"intent_{predicted_id}"
         
-        return {
-            'intent': predicted_intent,
-            'confidence': float(intent_confidence)
-        }
+        return predicted_intent, confidence
     
-    def _predict_entities(self, text: str) -> List[Dict[str, str]]:
-        """Predict named entities (slots) for the input text"""
-        # Tokenize the text
+    def predict_entities(self, text):
+        """Predict entities/slots for the input text"""
+        # Tokenize
         tokens = self.tokenizer.tokenize(text)
         
-        # Prepare inputs for NER model
-        ner_inputs = self.tokenizer(
+        # Prepare inputs
+        inputs = self.tokenizer(
             text,
             return_tensors="pt",
-            truncation=True,
             padding=True,
-            max_length=128,
-            return_offsets_mapping=False
+            truncation=True,
+            max_length=128
         )
         
-        # Move to GPU if available  
-        if torch.cuda.is_available():
-            ner_inputs = {k: v.cuda() for k, v in ner_inputs.items()}
-        
-        # Predict
         with torch.no_grad():
-            ner_outputs = self.ner_model(**ner_inputs)
-            predictions = torch.argmax(ner_outputs.logits, dim=-1).squeeze().tolist()
+            outputs = self.ner_model(**inputs)
+            predictions = torch.argmax(outputs.logits, dim=-1).squeeze().tolist()
         
-        # Convert predictions to entities
-        entities = self._extract_entities(tokens, predictions)
+        # Extract entities using BIO tagging
+        entities = self._extract_entities_from_predictions(tokens, predictions)
         
         return entities
     
-    def _extract_entities(self, tokens: List[str], predictions: List[int]) -> List[Dict[str, str]]:
-        """Extract entities from token predictions using BIO tagging"""
+    def _extract_entities_from_predictions(self, tokens, predictions):
+        """Extract entities from BIO predictions"""
         entities = []
         current_entity = None
         current_tokens = []
         
-        # Ensure predictions list matches tokens length
-        if len(predictions) > len(tokens):
-            predictions = predictions[1:len(tokens)+1]  # Skip [CLS] token
-        elif len(predictions) < len(tokens):
-            predictions = predictions[:len(tokens)]
+        # Handle single prediction case
+        if isinstance(predictions, int):
+            predictions = [predictions]
         
-        for i, (token, pred_id) in enumerate(zip(tokens, predictions)):
-            if pred_id >= len(self.id2label):
-                continue
-                
-            label = self.id2label[pred_id]
+        # Skip [CLS] token prediction if present
+        if len(predictions) > len(tokens):
+            predictions = predictions[1:len(tokens)+1]
+        
+        # Ensure we don't have more tokens than predictions
+        min_len = min(len(tokens), len(predictions))
+        
+        for i in range(min_len):
+            token = tokens[i]
+            pred_id = predictions[i]
+            
+            # Get label
+            if pred_id in self.id2label:
+                label = self.id2label[pred_id]
+            else:
+                label = 'O'  # Outside
             
             if label.startswith('B-'):
-                # Beginning of new entity
+                # Save previous entity
                 if current_entity and current_tokens:
-                    # Save previous entity
-                    entities.append({
-                        'type': current_entity,
-                        'filler': self.tokenizer.convert_tokens_to_string(current_tokens).strip()
-                    })
+                    entity_text = self.tokenizer.convert_tokens_to_string(current_tokens).strip()
+                    entities.append(f"{current_entity}:{entity_text}")
                 
+                # Start new entity
                 current_entity = label[2:]  # Remove 'B-' prefix
                 current_tokens = [token]
                 
             elif label.startswith('I-') and current_entity == label[2:]:
-                # Continuation of current entity
+                # Continue current entity
                 current_tokens.append(token)
                 
             else:
-                # Outside entity or different entity
+                # End current entity
                 if current_entity and current_tokens:
-                    entities.append({
-                        'type': current_entity,
-                        'filler': self.tokenizer.convert_tokens_to_string(current_tokens).strip()
-                    })
+                    entity_text = self.tokenizer.convert_tokens_to_string(current_tokens).strip()
+                    entities.append(f"{current_entity}:{entity_text}")
                 current_entity = None
                 current_tokens = []
         
         # Don't forget the last entity
         if current_entity and current_tokens:
-            entities.append({
-                'type': current_entity,
-                'filler': self.tokenizer.convert_tokens_to_string(current_tokens).strip()
-            })
+            entity_text = self.tokenizer.convert_tokens_to_string(current_tokens).strip()
+            entities.append(f"{current_entity}:{entity_text}")
         
         return entities
-
-def main():
-    """Main daemon loop"""
-    print(" Starting Vietnamese NLU daemon...")
     
+    def process(self, text):
+        """Main processing function - like the original predict() but more comprehensive"""
+        if not text or not text.strip():
+            return {"error": "Empty input"}
+        
+        try:
+            # Predict intent
+            intent, confidence = self.predict_intent(text)
+            
+            # Predict entities
+            entities = self.predict_entities(text)
+            
+            # Format result
+            result = {
+                "text": text,
+                "intent": intent,
+                "confidence": f"{confidence:.3f}",
+                "entities": entities,
+                "entity_count": len(entities)
+            }
+            
+            return result
+            
+        except Exception as e:
+            return {"error": f"Processing failed: {str(e)}"}
+
+# Initialize the NLU pipeline (like loading models in the original)
+nlu_pipeline = VNSLUPipeline()
+
+def predict(text):
+    """Main prediction function (keeping the same interface as original)"""
+    result = nlu_pipeline.process(text)
+    
+    # Convert to JSON string (like original output format)
+    return json.dumps(result, ensure_ascii=False)
+
+if __name__ == "__main__":
     # Create output directory
     os.makedirs(OUT_DIR, exist_ok=True)
     
-    # Initialize NLU processor
-    try:
-        nlu_processor = VNSLUProcessor()
-    except Exception as e:
-        print(f" Failed to initialize NLU processor: {e}")
-        return
-    
     print(f" Monitoring {TXT_DIR} for transcription files...")
     
-    # Main processing loop
+    # Main daemon loop (following the exact same pattern as daemon_stt.py)
     while True:
         try:
-            # Check for new transcription files
+            # Check if transcriptions directory exists
             if not os.path.exists(TXT_DIR):
                 time.sleep(1)
                 continue
-                
-            for filename in os.listdir(TXT_DIR):
-                if not filename.endswith(".txt"):
+            
+            # Process each .txt file (same pattern as daemon_stt.py)
+            for f in os.listdir(TXT_DIR):
+                if not f.endswith(".txt"): 
                     continue
                 
-                input_path = os.path.join(TXT_DIR, filename)
+                path = os.path.join(TXT_DIR, f)
                 
-                # Read transcription
+                # Read transcription (with encoding handling)
                 try:
-                    with open(input_path, 'r', encoding='utf-8') as f:
-                        text = f.read().strip()
-                    
-                    if not text:
-                        print(f"  Empty transcription: {filename}")
-                        os.remove(input_path)
+                    with open(path, 'r', encoding='utf-8') as r:
+                        txt = r.read().strip()
+                except UnicodeDecodeError:
+                    try:
+                        with open(path, 'r', encoding='utf-16') as r:
+                            txt = r.read().strip()
+                    except:
+                        print(f" Cannot read {f}, skipping...")
+                        os.remove(path)
                         continue
-                    
-                    # Process with NLU
-                    result = nlu_processor.predict(text)
-                    
-                    # Save results
-                    output_filename = filename.replace(".txt", "_nlu.json")
-                    output_path = os.path.join(OUT_DIR, output_filename)
-                    
-                    with open(output_path, 'w', encoding='utf-8') as f:
-                        json.dump(result, f, ensure_ascii=False, indent=2)
-                    
-                    # Remove processed transcription
-                    os.remove(input_path)
-                    
-                    # Log results
-                    print(f" NLU processed: {filename}")
-                    print(f"    Text: {text}")
-                    print(f"    Intent: {result['intent']} (confidence: {result['intent_confidence']:.3f})")
-                    print(f"     Entities: {result['entities']}")
-                    print(f"    Saved: {output_path}")
-                    print("-" * 60)
-                    
-                except Exception as e:
-                    print(f" Error processing {filename}: {e}")
-                    # Don't remove file on error, might be temporary issue
+                
+                # Skip empty files
+                if not txt:
+                    os.remove(path)
                     continue
-        
+                
+                # Process with NLU pipeline
+                result = predict(txt)
+                
+                # Save result (same pattern as daemon_stt.py)
+                out = os.path.join(OUT_DIR, f.replace(".txt", "_nlu.txt"))
+                with open(out, "w", encoding='utf-8') as w:
+                    w.write(result)
+                
+                # Remove processed transcription (same as daemon_stt.py)
+                os.remove(path)
+                
+                # Log success (same format as daemon_stt.py)
+                print(f"  NLU processed → {out}")
+                print(f"    Input: {txt}")
+                print(f"    Output: {result}")
+                
         except KeyboardInterrupt:
-            print("\n NLU daemon stopped by user")
+            print("\n NLU daemon stopped")
             break
         except Exception as e:
-            print(f" Unexpected error in main loop: {e}")
-            time.sleep(5)  # Wait before retrying
+            print(f" Error in main loop: {e}")
         
         time.sleep(1)
-
-if __name__ == "__main__":
-    main()
