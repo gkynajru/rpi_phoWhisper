@@ -1,0 +1,20 @@
+# Ignore virtual environment
+venv/
+
+# Ignore data and model outputs
+data/
+__pycache__/
+*.pyc
+*.wav
+*.txt
+*.log
+
+#Ignore test service
+stt_testing/
+
+#Ignore modeld data
+models/
+
+# VSCode & system files
+.vscode/
+.DS_Store
