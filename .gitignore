@@ -9,6 +9,10 @@ __pycache__/
 *.txt
 *.log
 
+#Ignore test service
+stt_testing/
+
+#Ignore modeld data
 models/
 
 # VSCode & system files
