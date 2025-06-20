@@ -1,3 +1,5 @@
+# COMPLETE FIX for new_stt_integrated.py
+
 import numpy as np
 from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
 import torch
@@ -11,11 +13,10 @@ import subprocess
 import sys
 
 # Configuration
-PHOWHISPER_MODEL = "models/phowhisper_multistage"  # Path to PhoWhisper checkpoint
+PHOWHISPER_MODEL = "models/phowhisper_multistage"
 TRANSCRIPTION_DIR = "data/transcriptions"
-AUDIO_CHUNKS_DIR = "data/audio_chunks"  # Same as audio system
-INPUT_SAMPLE_RATE = 48000  # Matches new_audio_update_v3
-OUTPUT_SAMPLE_RATE = 16000  # Required by PhoWhisper
+AUDIO_CHUNKS_DIR = "data/audio_chunks"
+OUTPUT_SAMPLE_RATE = 16000  # Required by PhoWhisper - ONLY keep target rate
 
 # Create directories
 os.makedirs(TRANSCRIPTION_DIR, exist_ok=True)
@@ -35,47 +36,48 @@ except Exception as e:
     print(f"❌ Failed to load PhoWhisper model: {e}")
     exit(1)
 
-def simple_downsample(audio_data, factor=3):
-    """Simple downsampling by taking every nth sample"""
+def resample_audio_smart(audio_data, actual_sr, target_sr):
+    """SMART resampling that uses ACTUAL sample rate"""
     try:
-        audio_data = np.nan_to_num(audio_data, nan=0.0, posinf=0.0, neginf=0.0)
-        audio_data = np.clip(audio_data, -32768, 32767)
-        return audio_data[::factor]
-    except Exception as e:
-        print(f"Simple downsample error: {e}")
-        return None
-
-def resample_audio(audio_data, original_sr, target_sr):
-    """Resample audio data from original_sr to target_sr."""
-    try:
-        # Method 1: Simple downsampling (fast and stable)
-        if original_sr == 48000 and target_sr == 16000:
-            return simple_downsample(audio_data, factor=3)
+        # If already at target rate, no resampling needed!
+        if actual_sr == target_sr:
+            print(f"✅ Audio already at {target_sr}Hz, no resampling needed")
+            return audio_data.astype(np.float32)
         
-        # Method 2: Librosa fallback
-        clean_data = audio_data.astype(np.float32)
-        clean_data = np.nan_to_num(clean_data, nan=0.0, posinf=0.0, neginf=0.0)
-        resampled = librosa.resample(clean_data, orig_sr=original_sr, target_sr=target_sr)
-        return np.clip(resampled, -32768, 32767)
-    except Exception as e:
-        print(f"Resample error: {e}")
-        # Last resort - simple decimation
-        factor = int(original_sr / target_sr)
-        return audio_data[::factor]
-
-def transcribe(audio):
-    """Transcribe audio using PhoWhisper model."""
-    try:
-        # Resample audio from 48 kHz to 16 kHz
-        audio_resampled = resample_audio(audio, INPUT_SAMPLE_RATE, OUTPUT_SAMPLE_RATE)
-        if audio_resampled is None:
-            return ""
+        # Otherwise, use high-quality librosa resampling
+        print(f"🔄 Resampling from {actual_sr}Hz to {target_sr}Hz")
+        audio_float = audio_data.astype(np.float32)
+        if np.max(np.abs(audio_float)) > 1.0:
+            audio_float = audio_float / 32768.0  # Normalize if int16
             
-        # Convert to float32 and normalize
-        audio_float = audio_resampled.astype(np.float32) / 32768.0
+        resampled = librosa.resample(audio_float, orig_sr=actual_sr, target_sr=target_sr)
+        return resampled
+        
+    except Exception as e:
+        print(f"❌ Resample error: {e}")
+        # If librosa fails, at least don't make it worse
+        if actual_sr == target_sr:
+            return audio_data.astype(np.float32)
+        else:
+            # Basic linear interpolation fallback
+            from scipy import signal
+            num_samples = int(len(audio_data) * target_sr / actual_sr)
+            return signal.resample(audio_data.astype(np.float32), num_samples)
+
+def transcribe_fixed(audio_data, actual_sample_rate):
+    """FIXED transcribe function that uses ACTUAL sample rate"""
+    try:
+        print(f"🎤 Transcribing audio: {len(audio_data)} samples @ {actual_sample_rate}Hz")
+        
+        # Smart resampling using ACTUAL sample rate
+        audio_resampled = resample_audio_smart(audio_data, actual_sample_rate, OUTPUT_SAMPLE_RATE)
+        
+        # Ensure proper normalization for model
+        if np.max(np.abs(audio_resampled)) > 1.0:
+            audio_resampled = audio_resampled / np.max(np.abs(audio_resampled))
         
         # Process audio for PhoWhisper
-        inputs = processor(audio_float, sampling_rate=OUTPUT_SAMPLE_RATE, return_tensors="pt")
+        inputs = processor(audio_resampled, sampling_rate=OUTPUT_SAMPLE_RATE, return_tensors="pt")
         
         with torch.no_grad():
             generated_ids = model.generate(
@@ -92,37 +94,36 @@ def transcribe(audio):
         return ""
 
 def monitor_audio_files():
-    """Monitor for new speech files and transcribe them"""
+    """Monitor for new speech files and transcribe them - FIXED VERSION"""
     processed_files = set()
     
     while True:
         try:
             # Check for new speech files
             if os.path.exists(AUDIO_CHUNKS_DIR):
-                # speech_files = [f for f in os.listdir(AUDIO_CHUNKS_DIR) 
-                #               if f.startswith('speech_') and f.endswith('.wav') and f not in processed_files]
-                #             #   if f.startswith('speech_16k') and f.endswith('.wav') and f not in processed_files]
-                                
+                # Process BOTH 16kHz and 48kHz files properly
                 speech_files = [f for f in os.listdir(AUDIO_CHUNKS_DIR) 
-                                if f.startswith('speech_') 
-                                and f.endswith('.wav') 
-                                and 'speech_16k' not in f 
-                                and f not in processed_files]
+                              if (f.startswith('speech_') or f.startswith('speech_16k_')) 
+                              and f.endswith('.wav') and f not in processed_files]
                 
                 for filename in speech_files:
                     file_path = os.path.join(AUDIO_CHUNKS_DIR, filename)
                     
                     try:
-                        # Load audio file
-                        audio_data, sample_rate = sf.read(file_path)
+                        # Load audio file and get ACTUAL sample rate
+                        audio_data, actual_sample_rate = sf.read(file_path)
+                        print(f"📁 Processing: {filename} ({len(audio_data)} samples @ {actual_sample_rate}Hz)")
                         
-                        # Convert to int16 if needed
+                        # Convert to int16 if needed (for consistency)
                         if audio_data.dtype != np.int16:
-                            audio_data = (audio_data * 32767).astype(np.int16)
+                            if np.max(np.abs(audio_data)) <= 1.0:
+                                audio_data = (audio_data * 32767).astype(np.int16)
+                            else:
+                                audio_data = audio_data.astype(np.int16)
                         
-                        # Transcribe
+                        # Transcribe using ACTUAL sample rate
                         start_time = time.time()
-                        transcription = transcribe(audio_data)
+                        transcription = transcribe_fixed(audio_data, actual_sample_rate)
                         latency = time.time() - start_time
                         
                         print(f"🎤 Transcription: '{transcription}' (Latency: {latency:.2f}s)")
@@ -151,16 +152,17 @@ def monitor_audio_files():
             time.sleep(1)
 
 def stt_queue_processor():
-    """Process audio from queue (if using shared queue)"""
+    """Process audio from queue - FIXED VERSION"""
     print("🎧 STT queue processor started...")
     
     while True:
         try:
-            # Get audio data from the queue
+            # Get audio data from the queue - ASSUME it's 48kHz from live system
             audio_data = audio_queue.get(timeout=1.0)
             
             start_time = time.time()
-            transcription = transcribe(audio_data)
+            # Queue audio comes from live system, likely 48kHz
+            transcription = transcribe_fixed(audio_data, 48000)  # Explicit sample rate
             latency = time.time() - start_time
             
             print(f"🎤 Queue Transcription: '{transcription}' (Latency: {latency:.2f}s)")
@@ -173,10 +175,10 @@ def stt_queue_processor():
                     f.write(transcription)
                 print(f"💾 Queue transcription saved: {file_path}")
             
-            audio_queue.task_done()  # Mark the task as done
+            audio_queue.task_done()
             
         except queue.Empty:
-            continue  # Queue is empty, keep waiting
+            continue
         except KeyboardInterrupt:
             print("🛑 Stopping STT queue processor...")
             break
@@ -184,19 +186,27 @@ def stt_queue_processor():
             print(f"❌ STT queue error: {e}")
             continue
 
+# BACKWARD COMPATIBILITY: Keep old function name but with warning
+def transcribe(audio):
+    """DEPRECATED - Use transcribe_fixed() with actual sample rate"""
+    print("⚠️ WARNING: Using deprecated transcribe() function")
+    print("⚠️ This function assumes 48kHz input - may cause audio distortion!")
+    return transcribe_fixed(audio, 48000)  # Default to 48kHz assumption
+
 def main():
-    """Main STT service"""
+    """Main STT service - FIXED VERSION"""
     import argparse
     
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description='STT Service')
+    parser = argparse.ArgumentParser(description='STT Service (FIXED)')
     parser.add_argument('--method', choices=['1', '2', '3'], 
                        help='Processing method: 1=File monitoring, 2=Queue processing, 3=Both')
     args = parser.parse_args()
     
-    print("🚀 Starting STT service...")
+    print("🚀 Starting FIXED STT service...")
     print(f"📁 Monitoring directory: {AUDIO_CHUNKS_DIR}")
     print(f"💾 Saving transcriptions to: {TRANSCRIPTION_DIR}")
+    print("🔧 Now using ACTUAL sample rates from files!")
     
     # Determine processing method
     if args.method:
@@ -222,7 +232,7 @@ def main():
         file_thread.daemon = True
         file_thread.start()
         threads.append(file_thread)
-        print("✅ File monitoring thread started")
+        print("✅ FIXED file monitoring thread started")
     
     if processing_method in ['2', '3']:
         # Start queue processing thread
@@ -230,14 +240,14 @@ def main():
         queue_thread.daemon = True
         queue_thread.start()
         threads.append(queue_thread)
-        print("✅ Queue processing thread started")
+        print("✅ FIXED queue processing thread started")
     
     try:
         # Keep main thread alive
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\n🛑 Stopping STT service...")
+        print("\n🛑 Stopping FIXED STT service...")
         print("✅ STT service stopped")
 
 if __name__ == "__main__":
