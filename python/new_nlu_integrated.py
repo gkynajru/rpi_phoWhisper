@@ -20,7 +20,7 @@ OUTPUT_SAMPLE_RATE = 16000  # Match STT system
 # Create output directory
 os.makedirs(NLU_RESULTS_DIR, exist_ok=True)
 
-# Shared queue for transcriptions (to receive from STT)
+# Shared queue for transcriptions
 transcription_queue = queue.Queue()
 
 # Initialize Intent Classifier
@@ -42,8 +42,14 @@ try:
     ner_tokenizer = AutoTokenizer.from_pretrained(NER_MODEL_PATH)
     ner_model = AutoModelForTokenClassification.from_pretrained(NER_MODEL_PATH)
     ner_model.eval()
-    with open(os.path.join(NER_MODEL_PATH, 'label_mappings.json'), 'rb') as f:
-        ner_label_mappings = json.load(f)
+    with open(os.path.join(NER_MODEL_PATH, 'label_mappings.json'), 'r', encoding='utf-8') as f:
+        label_data = json.load(f)
+        if 'slot_labels' not in label_data:
+            # Convert dictionary to list if needed
+            slot_labels = [label_data[str(i)] for i in range(len(label_data))]
+            ner_label_mappings = {'slot_labels': slot_labels}
+        else:
+            ner_label_mappings = label_data
     print("✅ NER model loaded successfully")
 except Exception as e:
     print(f"❌ Failed to load NER model: {e}")
@@ -76,20 +82,45 @@ def process_ner(text):
         
         entities = []
         current_entity = None
-        for token, pred_id in zip(tokens, predictions):
-            label = ner_label_mappings[str(pred_id)]
-            if label.startswith('B-'):
-                if current_entity:
-                    entities.append(current_entity)
-                current_entity = {"entity": label[2:], "text": token}
-            elif label.startswith('I-') and current_entity:
-                current_entity["text"] += " " + token
-            else:
-                if current_entity:
-                    entities.append(current_entity)
+        current_tokens = []
+        
+        for token, ner_id in zip(tokens, predictions[:len(tokens)]):
+            if ner_id < len(ner_label_mappings['slot_labels']):
+                label = ner_label_mappings['slot_labels'][ner_id]
+                
+                if label.startswith('B-'):
+                    if current_entity and current_tokens:
+                        entities.append({
+                            'entity': current_entity,
+                            'value': ner_tokenizer.convert_tokens_to_string(current_tokens).strip()
+                        })
+                    current_entity = label[2:]
+                    current_tokens = [token]
+                elif label.startswith('I-') and current_entity:
+                    current_tokens.append(token)
+                else:
+                    if current_entity and current_tokens:
+                        entities.append({
+                            'entity': current_entity,
+                            'value': ner_tokenizer.convert_tokens_to_string(current_tokens).strip()
+                        })
                     current_entity = None
-        if current_entity:
-            entities.append(current_entity)
+                    current_tokens = []
+            else:
+                print(f"⚠️ Invalid NER ID: {ner_id}, skipping...")
+                if current_entity and current_tokens:
+                    entities.append({
+                        'entity': current_entity,
+                        'value': ner_tokenizer.convert_tokens_to_string(current_tokens).strip()
+                    })
+                current_entity = None
+                current_tokens = []
+        
+        if current_entity and current_tokens:
+            entities.append({
+                'entity': current_entity,
+                'value': ner_tokenizer.convert_tokens_to_string(current_tokens).strip()
+            })
         
         return entities
     except Exception as e:
@@ -126,7 +157,7 @@ def monitor_transcription_files():
                             print(f"⏱️ NLU Latency: {latency:.2f}s")
                             
                             # Save NLU result
-                            timestamp = time.strftime("%Y%m%d_%H%M%S")
+                            timestamp = time.strftime("%Y%m%d_%HMMSS")
                             nlu_result_path = f"{NLU_RESULTS_DIR}/nlu_{timestamp}.json"
                             with open(nlu_result_path, 'w', encoding='utf-8') as f:
                                 json.dump({
@@ -170,7 +201,7 @@ def nlu_queue_processor():
             print(f"⏱️ NLU Latency: {latency:.2f}s")
             
             # Save NLU result
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            timestamp = time.strftime("%Y%m%d_%HMMSS")
             nlu_result_path = f"{NLU_RESULTS_DIR}/nlu_queue_{timestamp}.json"
             with open(nlu_result_path, 'w', encoding='utf-8') as f:
                 json.dump({
