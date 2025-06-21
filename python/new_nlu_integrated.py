@@ -15,13 +15,15 @@ NER_MODEL_PATH = "models/phobert/ner_model_final"
 INTENT_ENCODER_PATH = "models/phobert/intent_encoder.pkl"
 NLU_RESULTS_DIR = "data/nlu_results"
 TRANSCRIPTION_DIR = "data/transcriptions"
-OUTPUT_SAMPLE_RATE = 16000  # Match STT system
 
 # Create output directory
 os.makedirs(NLU_RESULTS_DIR, exist_ok=True)
 
 # Shared queue for transcriptions
 transcription_queue = queue.Queue()
+
+# File counter for unique filenames
+file_counter = 0
 
 # Initialize Intent Classifier
 try:
@@ -92,7 +94,7 @@ def process_ner(text):
                     if current_entity and current_tokens:
                         entities.append({
                             'entity': current_entity,
-                            'value': ner_tokenizer.convert_tokens_to_string(current_tokens).strip()
+                            'text': ner_tokenizer.convert_tokens_to_string(current_tokens).strip()
                         })
                     current_entity = label[2:]
                     current_tokens = [token]
@@ -102,7 +104,7 @@ def process_ner(text):
                     if current_entity and current_tokens:
                         entities.append({
                             'entity': current_entity,
-                            'value': ner_tokenizer.convert_tokens_to_string(current_tokens).strip()
+                            'text': ner_tokenizer.convert_tokens_to_string(current_tokens).strip()
                         })
                     current_entity = None
                     current_tokens = []
@@ -111,7 +113,7 @@ def process_ner(text):
                 if current_entity and current_tokens:
                     entities.append({
                         'entity': current_entity,
-                        'value': ner_tokenizer.convert_tokens_to_string(current_tokens).strip()
+                        'text': ner_tokenizer.convert_tokens_to_string(current_tokens).strip()
                     })
                 current_entity = None
                 current_tokens = []
@@ -119,7 +121,7 @@ def process_ner(text):
         if current_entity and current_tokens:
             entities.append({
                 'entity': current_entity,
-                'value': ner_tokenizer.convert_tokens_to_string(current_tokens).strip()
+                'text': ner_tokenizer.convert_tokens_to_string(current_tokens).strip()
             })
         
         return entities
@@ -129,6 +131,7 @@ def process_ner(text):
 
 def monitor_transcription_files():
     """Monitor transcription files and process them with NLU"""
+    global file_counter
     processed_files = set()
     
     while True:
@@ -156,9 +159,10 @@ def monitor_transcription_files():
                             print(f"📍 Entities: {ner_result}")
                             print(f"⏱️ NLU Latency: {latency:.2f}s")
                             
-                            # Save NLU result
-                            timestamp = time.strftime("%Y%m%d_%HMMSS")
-                            nlu_result_path = f"{NLU_RESULTS_DIR}/nlu_{timestamp}.json"
+                            # Save NLU result with unique timestamp and counter
+                            timestamp = time.strftime("%Y%m%d_%H%M%S")
+                            file_counter += 1
+                            nlu_result_path = f"{NLU_RESULTS_DIR}/nlu_{timestamp}_{file_counter:03d}.json"
                             with open(nlu_result_path, 'w', encoding='utf-8') as f:
                                 json.dump({
                                     "transcription": text,
@@ -184,6 +188,7 @@ def monitor_transcription_files():
 
 def nlu_queue_processor():
     """Process transcriptions from queue"""
+    global file_counter
     print("🎧 NLU queue processor started...")
     
     while True:
@@ -200,9 +205,10 @@ def nlu_queue_processor():
             print(f"📍 Entities: {ner_result}")
             print(f"⏱️ NLU Latency: {latency:.2f}s")
             
-            # Save NLU result
-            timestamp = time.strftime("%Y%m%d_%HMMSS")
-            nlu_result_path = f"{NLU_RESULTS_DIR}/nlu_queue_{timestamp}.json"
+            # Save NLU result with unique timestamp and counter
+            timestamp = time.strftime("%Y%m%d_%H%M%S_%f")
+            file_counter += 1
+            nlu_result_path = f"{NLU_RESULTS_DIR}/nlu_queue_{timestamp}_{file_counter:03d}.json"
             with open(nlu_result_path, 'w', encoding='utf-8') as f:
                 json.dump({
                     "transcription": text,
