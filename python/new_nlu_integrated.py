@@ -5,7 +5,7 @@ import queue
 import threading
 import pickle
 import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoModelForTokenClassification
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoModelForTokenClassification, pipeline
 import numpy as np
 import json
 
@@ -38,20 +38,19 @@ except Exception as e:
     print(f"❌ Failed to load Intent Classifier: {e}")
     exit(1)
 
-# Initialize NER model
+# Initialize NER model with pipeline
 try:
     print("🔄 Loading NER model...")
     ner_tokenizer = AutoTokenizer.from_pretrained(NER_MODEL_PATH)
     ner_model = AutoModelForTokenClassification.from_pretrained(NER_MODEL_PATH)
-    ner_model.eval()
-    with open(os.path.join(NER_MODEL_PATH, 'label_mappings.json'), 'r', encoding='utf-8') as f:
-        label_data = json.load(f)
-        if 'slot_labels' not in label_data:
-            # Convert dictionary to list if needed
-            slot_labels = [label_data[str(i)] for i in range(len(label_data))]
-            ner_label_mappings = {'slot_labels': slot_labels}
-        else:
-            ner_label_mappings = label_data
+    
+    # Create pipeline for NER
+    ner_pipeline = pipeline(
+        "token-classification",
+        model=ner_model,
+        tokenizer=ner_tokenizer,
+        aggregation_strategy="simple"
+    )
     print("✅ NER model loaded successfully")
 except Exception as e:
     print(f"❌ Failed to load NER model: {e}")
@@ -73,55 +72,18 @@ def process_intent(text):
         return {"intent": "unknown", "confidence": 0.0}
 
 def process_ner(text):
-    """Process text to extract named entities using PhoBERT NER"""
+    """Process text to extract named entities using PhoBERT NER with pipeline"""
     try:
-        inputs = ner_tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=128)
-        with torch.no_grad():
-            outputs = ner_model(**inputs)
-        logits = outputs.logits
-        predictions = torch.argmax(logits, dim=-1)[0].tolist()
-        tokens = ner_tokenizer.convert_ids_to_tokens(inputs['input_ids'][0])
+        # Use pipeline for NER
+        results = ner_pipeline(text)
         
+        # Format entities to match the original structure but with score
         entities = []
-        current_entity = None
-        current_tokens = []
-        
-        for token, ner_id in zip(tokens, predictions[:len(tokens)]):
-            if ner_id < len(ner_label_mappings['slot_labels']):
-                label = ner_label_mappings['slot_labels'][ner_id]
-                
-                if label.startswith('B-'):
-                    if current_entity and current_tokens:
-                        entities.append({
-                            'entity': current_entity,
-                            'text': ner_tokenizer.convert_tokens_to_string(current_tokens).strip()
-                        })
-                    current_entity = label[2:]
-                    current_tokens = [token]
-                elif label.startswith('I-') and current_entity:
-                    current_tokens.append(token)
-                else:
-                    if current_entity and current_tokens:
-                        entities.append({
-                            'entity': current_entity,
-                            'text': ner_tokenizer.convert_tokens_to_string(current_tokens).strip()
-                        })
-                    current_entity = None
-                    current_tokens = []
-            else:
-                print(f"⚠️ Invalid NER ID: {ner_id}, skipping...")
-                if current_entity and current_tokens:
-                    entities.append({
-                        'entity': current_entity,
-                        'text': ner_tokenizer.convert_tokens_to_string(current_tokens).strip()
-                    })
-                current_entity = None
-                current_tokens = []
-        
-        if current_entity and current_tokens:
+        for result in results:
             entities.append({
-                'entity': current_entity,
-                'text': ner_tokenizer.convert_tokens_to_string(current_tokens).strip()
+                'entity': result['entity_group'],
+                'value': result['word'],
+                'score': round(result['score'], 4)
             })
         
         return entities
